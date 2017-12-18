@@ -93,3 +93,6 @@ Revision history
 
 22 November 2017: Initial release.
 (Tom Stepleton, stepleton@gmail.com, London)
+
+18 December 2017: Omit unnecessary backup copy of c.
+(Tom Stepleton)

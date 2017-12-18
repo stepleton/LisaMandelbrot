@@ -147,10 +147,8 @@ MANDEL:
 .lo MOVE.L  #kTopLeft,D0             ;   Set c for top left corner
 
     ; Is the current point in the set?
-.li MOVE.L  D0,D6
-    MOVE.W  #(kIterations-1),D1      ;     Do <=40 iterations of mandelbration
+.li MOVE.W  #(kIterations-1),D1      ;     Do <=40 iterations of mandelbration
     BSR.B   MANDITER                 ;     Call mandelbrator
-    MOVE.L  D6,D0
 
     ; Add verdict to the accumulator. If the accumulator is full (as marked by
     ; a sentinel bit arriving in bit location 8), write the byte to the screen.
