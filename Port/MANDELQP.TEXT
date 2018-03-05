@@ -1,0 +1,1211 @@
+{ LisaMandelbrot Port -- QuickPort-based Mandelbrot set viewer.
+
+A Mandelbrot set viewer for the Lisa Office System making use of the QuickPort
+library for Office System applications. Plots the Mandelbrot set as calculated
+by the 32-bit fixed-point complex number routines in MANDLIB. Remains fully
+interactive at all times---although while calculating pixels in a new plot,
+response times for most kinds of interaction (with LisaMandelbrot and any other
+programs running on your computer) may be long.
+
+All control is via the mouse. Buttons around the edge of the graph zoom in and
+out, pause/resume/restart set calculation, change the number of iterations, and
+reset the graph to the original zoom area. Zoom boxes can be created and moved
+by making typical click and drag actions with the mouse. Click outside the
+graph window to reset the zoom box to the graph window's current zoom. For the
+moment, the zoom box can't be resized via mouse actions---draw a new zoom box
+instead.
+
+Ordinarily the zoom box is shown as a rectangular border, but if it covers an
+area smaller than the maximum zoom supported by LisaMandelbrot Pro, it becomes
+a solid rectangle. For these zoom boxes, LisaMandelbrot Pro can only zoom out.
+
+LisaMandelbrot Port and any supporting programs, software libraries, and
+documentation distributed alongside it are released into the public domain
+without any warranty. See the UNLICENSE file for details. }
+
+
+PROGRAM LisaMandelbrotPort;
+
+
+USES
+    FPLib,
+    {$U LM/MANDLIB.OBJ }      Mandlib,
+    {$U QuickDraw.OBJ }       QuickDraw,
+    {$U QP/UQPortCall.OBJ }   UQPortCall,
+    {$U QP/UQPortGraph.OBJ }  UQPortGraph,
+    {$U QP/Hardware.OBJ }     Hardware;
+
+
+CONST
+    { Graph window dimensions. }
+    kWinCols = 512;    { Must be a multiple of 16. }
+    kWinRows = 256;
+    kZoomCols = 1536;  { See comments for FitRealBox in MANDLIB for details }
+    kZoomRows = 1024;  { on how to set these two zooming parameters. }
+    kWinColBytes = { kWinCols DIV 8 = } 64;
+    kWinBytes = { kWinRows * kWinColBytes = } 16384;
+
+    { Graph window real and imaginary extents must be even multiples of this: }
+    { kWinQuantum = LeastCommonMult(kWinCols, kWinRows) * kQuantum = 0.03125; }
+    { But we don't actually use that number in code. The number we do use (in
+      the Zoom and DrawZoomBox procedures) is kZoomQuantum, which "snaps" zoom
+      boxes to those whose real and imaginary extents are even multiples of
+      kWinQuantum. (LeastIntMult(x) is the smallest integer multiple of x.) }
+    kZoomQuantum = { LeastIntMult(kAspect) / kAspect * kQuantum = } 0.0625;
+
+    { Graph window screen positioning: top-left corner. }
+    kWinTLX = 90;
+    kWinTLY = 16;
+
+    { Original plotting coordinates. }
+    kInitTlx    = -2.0;
+    kInitTly    = -1.0;  { For simplicity we display the set "upside down"! }
+    kInitWidth  = 3.0;   { See notes above the declaration of BOXGRAPH. }
+    kInitHeight = 2.0;
+
+    kAspect     = { kInitWidth / kInitHeight = } 1.5;
+
+    { Other defaults. }
+    kInitIters  = 40;     { Default number of z' = z^2 + c iterations. }
+
+    { Miscellaneous constants. }
+    FCent12 = 10;  { In QDSupport; missing in QuickPort. }
+
+
+TYPE
+    { LisaMandelbrot is fully interactive at all times (if a bit slow perhaps).
+      At any moment, it can be in any of the following states: }
+    LMState = (
+        IDLE,     { Finished computing a Mandelbrot set plot. }
+        DRAWING,  { Actively computing a new Mandelbrot set plot. }
+        PAUSED    { Suspended in the middle of computing a plot of the set. }
+    );
+
+    { How to interpret the zoom box: zoom in or out. }
+    ZoomDirection = (
+        ZOOMIN,
+        ZOOMOUT
+    );
+
+    { For button bitmaps. }
+    ButtonType = (
+        BZOOMIN,
+        BZOOMOUT,
+        BRESET,
+        BPLUS,
+        BMINUS,
+        BPLAY,
+        BPAUSE
+    );
+    ButtonBitmap = ARRAY[0..79] OF QDByte;
+
+
+VAR
+    { Graph window bitmap and its bytes. }
+    MANDBITMAP:    BitMap;
+    MANDBITS:      ARRAY[0..kWinBytes] OF LMByte;  { one extra byte! lol... }
+
+    { Button bitmaps and top-left corner locations. }
+    BUTTONS:       ARRAY[ButtonType] OF ButtonBitmap;
+    BUTTON_POS:    ARRAY[ButtonType] OF Point;
+
+    { Remaining globals make up the program's interactive state. }
+
+    { Graph window and zoom box dimensions. Graph window width and height are
+      always even multiples of kWinQuantum. The top left pixel of the graph
+      corresponds to the complex number BOXGRAPH.tly * i + BOXGRAPH.tlx, while
+      the bottom right pixel corresponds to the complex number
+
+         (BOXGRAPH.tly + (kWinRows-1)/kWinRows * BOXGRAPH.h) * i +
+         (BOXGRAPH.tlx + (kWinCols-1)/kWinCols * BOXGRAPH.w).
+
+      1. The top and left edges of the graph window are plotted; the bottom and
+         right edges are not.
+      2. The plot is "upside down", in that the imaginary part increases as you
+         move from the top of the plot to the bottom. Luckily, the Mandelbrot
+         set is symmetric across the real axis. }
+    BOXGRAPH:      RealBox;  { Complex plane area covered by the graph window. }
+    BOXZOOM:       RealBox;  { Complex plane area covered by the zoom window. }
+
+    { Mandelbrot set calculation state. }
+    BITMAP_INDEX:  Integer;  { Current character index into MANDBITMAP... }
+    BITMAP_ROW:    Integer;  { ...which corresponds to this row... }
+    BITMAP_COL:    Integer;  { ...and this column... }
+    C_IMAG:        Real;     { ...and this imaginary part... }
+    C_REAL:        Real;     { ...and this real part of a complex number. }
+    C_IMAG_INCR:   Real;     { Imaginary axis increment. }
+    C_REAL_8INCR:  Real;     { Real axis increment, times 8. }
+    C_REAL_FINCR:  Integer;  { Real axis increment, in the fixed-point format. }
+
+    { Other globals. }
+    ITERATIONS:    Integer;  { Per-pixel z' = z^2 = c iterations. }
+    STATE:         LMState;  { What the program is up to right now. }
+
+
+{ PROCEDURES AND FUNCTIONS }
+
+    (**** INITIALISATION ****)
+
+    { Fill the graph bitmap with a grey pattern. }
+    PROCEDURE InitMandBits;
+    VAR
+        r, c, i:  Integer;
+        p:        LMByte;
+    BEGIN
+        { Sure, we could do this with QuickDraw, but maybe it's best to
+          avoid QD where we don't absolutely need it. }
+        i := 0;
+        FOR r := 0 TO (kWinRows - 1) DO BEGIN
+            IF ODD(r) THEN p := { $22 = } 34 ELSE p := { $88 = } -120;
+            FOR c := 0 TO (kWinColBytes - 1) DO BEGIN
+                MANDBITS[i] := p;
+                i := SUCC(i);
+            END;
+        END;
+    END;
+
+    { Used in InitGeometry. }
+    PROCEDURE ResetSetState; FORWARD;
+
+    { Initialise graph and zoom geometry. }
+    PROCEDURE InitGeometry;
+    BEGIN
+        WITH BOXGRAPH DO BEGIN
+            tlx := kInitTlx;
+            tly := kInitTly;
+            w := kInitWidth;
+            h := kInitHeight;
+        END;
+        BOXZOOM := BOXGRAPH;
+        { Reset plotting state variables for this graph window setting. }
+        ResetSetState;
+    END;
+
+
+    { Initialise other globals. }
+    PROCEDURE InitMiscellany;
+    BEGIN
+        ITERATIONS := kInitIters;
+        STATE := DRAWING;  { Begin drawing the set on program start. }
+
+        WITH MANDBITMAP DO BEGIN  { Set up QD metadata for our graph bitmap. }
+            baseAddr := @MANDBITS[0];
+            rowBytes := kWinColBytes;
+            SetRect(bounds, 0, 0, kWinCols, kWinRows);
+        END;
+
+        { Initialise all button bitmaps and locations. }
+        { Zoom-in button. }
+        SetPt(BUTTON_POS[BZOOMIN],
+              {h=}kWinTLX - 52,
+              {v=}kWinTLY + (kWinRows DIV 2) - 25);
+        StuffHex(@BUTTONS[BZOOMIN,  0],
+                 '3FFFFFE04000001080000008803FFFC880200048');
+        StuffHex(@BUTTONS[BZOOMIN, 20],
+                 '80206048802060488023FC488023FC4883A06048');
+        StuffHex(@BUTTONS[BZOOMIN, 40],
+                 '8220604882200048823FFFC89A01000893FF0008');
+        StuffHex(@BUTTONS[BZOOMIN, 60],
+                 '908000089F80000880000008400000103FFFFFE0');
+
+        { Zoom-out button. }
+        SetPt(BUTTON_POS[BZOOMOUT],
+              {h=}kWinTLX - 52,
+              {v=}kWinTLY + (kWinRows DIV 2) + 5);
+        StuffHex(@BUTTONS[BZOOMOUT,  0],
+                 '3FFFFFE040000010800000089FFFE00890002008');
+        StuffHex(@BUTTONS[BZOOMOUT, 20],
+                 '900020089000200891FE200891FA20089007FE08');
+        StuffHex(@BUTTONS[BZOOMOUT, 40],
+                 '90040208900402089FF4020880040FC88007E848');
+        StuffHex(@BUTTONS[BZOOMOUT, 60],
+                 '8000084880000FC880000008400000103FFFFFE0');
+
+        { Reset button. }
+        SetPt(BUTTON_POS[BRESET],
+              {h=}kWinTLX - 52,
+              {v=}kWinTLY + (kWinRows DIV 2) + 35);
+        StuffHex(@BUTTONS[BRESET,  0],
+                 '3FFFFFE04000001084000108848009089C8009C8');
+        StuffHex(@BUTTONS[BRESET, 20],
+                 '808088088F83CF888007E0088077E00881FFC008');
+        StuffHex(@BUTTONS[BRESET, 40],
+                 '8077E0088007E0088003C0088F808F8880800808');
+        StuffHex(@BUTTONS[BRESET, 60],
+                 '9C8009C88480090884000108400000103FFFFFE0');
+
+        { Plus button. }
+        SetPt(BUTTON_POS[BPLUS],
+              {h=}kWinTLX + (kWinCols DIV 2) + 100,
+              {v=}kWinTLY + kWinRows + 16);
+        StuffHex(@BUTTONS[BPLUS,  0],
+                 '3FFFFFE040000010800000088000000880070008');
+        StuffHex(@BUTTONS[BPLUS, 20],
+                 '8007000880070008800700088007000883FFFE08');
+        StuffHex(@BUTTONS[BPLUS, 40],
+                 '83FFFE0880070008800700088007000880070008');
+        StuffHex(@BUTTONS[BPLUS, 60],
+                 '800700088000000880000008400000103FFFFFE0');
+
+        { Minus button. }
+        SetPt(BUTTON_POS[BMINUS],
+              {h=}kWinTLX + (kWinCols DIV 2) - 130,
+              {v=}kWinTLY + kWinRows + 16);
+        StuffHex(@BUTTONS[BMINUS,  0],
+                 '3FFFFFE040000010800000088000000880000008');
+        StuffHex(@BUTTONS[BMINUS, 20],
+                 '8000000880000008800000088000000883FFFE08');
+        StuffHex(@BUTTONS[BMINUS, 40],
+                 '83FFFE0880000008800000088000000880000008');
+        StuffHex(@BUTTONS[BMINUS, 60],
+                 '800000088000000880000008400000103FFFFFE0');
+
+        { Play button. }
+        SetPt(BUTTON_POS[BPLAY],
+              {h=}kWinTLX - 52,
+              {v=}kWinTLY + (kWinRows DIV 2) - 55);
+        StuffHex(@BUTTONS[BPLAY,  0],
+                 '3FFFFFE0400000108000000880C0000880F00008');
+        StuffHex(@BUTTONS[BPLAY, 20],
+                 '80FC000880FF000880FFC00880FFF00880FFFC08');
+        StuffHex(@BUTTONS[BPLAY, 40],
+                 '80FFFC0880FFF00880FFC00880FF000880FC0008');
+        StuffHex(@BUTTONS[BPLAY, 60],
+                 '80F0000880C0000880000008400000103FFFFFE0');
+
+        { Pause button. }
+        SetPt(BUTTON_POS[BPAUSE],
+              {h=}kWinTLX - 52,
+              {v=}kWinTLY + (kWinRows DIV 2) - 55);
+        StuffHex(@BUTTONS[BPAUSE,  0],
+                 '3FFFFFE040000010800000088000000880000008');
+        StuffHex(@BUTTONS[BPAUSE, 20],
+                 '80F8F80880F8F80880F8F80880F8F80880F8F808');
+        StuffHex(@BUTTONS[BPAUSE, 40],
+                 '80F8F80880F8F80880F8F80880F8F80880F8F808');
+        StuffHex(@BUTTONS[BPAUSE, 60],
+                 '800000088000000880000008400000103FFFFFE0');
+    END;
+
+    (**** MANDELBROT SET CALCULATION ****)
+
+    { Reset set calculation and plotting state variables based on BOXGRAPH. }
+    PROCEDURE ResetSetState;
+    BEGIN
+        BITMAP_INDEX := 0;             { Resume plotting at the first byte... }
+        BITMAP_ROW   := 0;             { ...which is on the first row... }
+        BITMAP_COL   := 0;             { ...and the first column... }
+        C_IMAG       := BOXGRAPH.tly;  { ...and whose first bit is this... }
+        C_REAL       := BOXGRAPH.tlx;  { ...complex number. }
+
+        { Finally, set the parameters for stepping through the plot. }
+        C_IMAG_INCR  := BOXGRAPH.h / kWinRows;
+        C_REAL_8INCR := BOXGRAPH.w / kWinColBytes;
+        C_REAL_FINCR := MakeFixedPoint(BOXGRAPH.w / kWinCols);
+    END;
+
+
+    { Add another byte to the Mandelbrot set display. }
+    PROCEDURE UpdateSet;
+    VAR
+        bi:  Integer;
+
+        { Enter an idle state when plotting is complete. }
+        PROCEDURE StopUpdating; BEGIN STATE := IDLE; Exit(UpdateSet); END;
+    BEGIN
+        { Enter an idle state if plotting is complete. }
+        IF BITMAP_INDEX >= kWinBytes THEN StopUpdating;
+        IF BITMAP_ROW >= kWinRows    THEN StopUpdating;
+
+        { If we're just now starting a row, grey it out as a signal that we
+          are currently working on plotting the set. }
+        IF BITMAP_COL = 0 THEN
+            FOR bi := BITMAP_INDEX TO (BITMAP_INDEX + kWinColBytes - 1) DO
+                MANDBITS[bi] := { $55 = } 85;
+
+        { Compute the next eight bits in the Mandelbrot set plot. }
+        MANDBITS[BITMAP_INDEX] := MandByte(
+            MakeComplex(C_REAL, C_IMAG), ITERATIONS, C_REAL_FINCR);
+
+        { Update set calculation state. }
+        BITMAP_INDEX := SUCC(BITMAP_INDEX);
+        BITMAP_COL := BITMAP_COL + 8;
+        IF BITMAP_COL < kWinCols THEN BEGIN  { Advance in the current row. }
+            C_REAL := C_REAL + C_REAL_8INCR;
+        END ELSE BEGIN                       { Or, move to next row. }
+            BITMAP_ROW := SUCC(BITMAP_ROW);
+            BITMAP_COL := 0;
+            C_IMAG := C_IMAG + C_IMAG_INCR;
+            C_REAL := BOXGRAPH.tlx;
+        END;
+    END;
+
+    (**** DRAWING ****)
+
+    { Draw the zoom box. Uses XOR, so draw again to erase it. }
+    PROCEDURE DrawZoomBox;
+    VAR
+        pen_state:  PenState;
+        zoom_rect:  Rect;
+    BEGIN
+        { Short circuit: don't draw if the zoom box is fully expanded. }
+        WITH BOXZOOM DO
+            IF tlx >= BOXGRAPH.tlx THEN
+                IF tly >= BOXGRAPH.tly THEN
+                    IF w >= BOXGRAPH.w THEN
+                        IF h >= BOXGRAPH.h THEN EXIT(DrawZoomBox);
+
+        { Compute zoom box rect relative to the top left corner of the graph. }
+        WITH BOXZOOM DO SetRect(
+            zoom_rect,
+            ROUND(kWinCols * (tlx - BOXGRAPH.tlx) / BOXGRAPH.w),
+            ROUND(kWinRows * (tly - BOXGRAPH.tly) / BOXGRAPH.h),
+            ROUND(kWinCols * (tlx + w - BOXGRAPH.tlx) / BOXGRAPH.w),
+            ROUND(kWinRows * (tly + h - BOXGRAPH.tly) / BOXGRAPH.h));
+
+        { Shift zoom box rect into the graph. }
+        OffsetRect(zoom_rect, kWinTLX, kWinTLY);
+
+        GetPenState(pen_state);  { Save pen state.}
+
+        { Draw zoom box. }
+        PenMode(patXor);         { Set pen mode to XOR. }
+        PenSize(2, 2);           { Make pen doubly-wide. }
+        FrameRect(zoom_rect);    { Draw zoom box. }
+
+        { Fill zoom box if it's smaller than the maximum zoom. }
+        IF BOXZOOM.H < kZoomQuantum THEN PaintRect(zoom_rect);
+
+        SetPenState(pen_state);  { Restore pen state from backup. }
+    END;
+
+
+    { Blit the graph bitmap and draw a frame around it. }
+    PROCEDURE DrawGraph;
+    VAR
+        src_rect:  Rect;
+        dst_rect:  Rect;
+    BEGIN
+        { Blit the graph bitmap. }
+        WITH MANDBITMAP DO BEGIN  { Even this rect stuff could be cached... }
+            src_rect := bounds;
+            dst_rect := bounds;
+        END;
+        OffsetRect(dst_rect, kWinTLX, kWinTLY);
+        CopyBits(MANDBITMAP, thePort^.portBits,
+                 src_rect, dst_rect, srcCopy, {maskRgn=}NIL);
+
+        { Draw a solid frame around it. }
+        InsetRect(dst_rect, -1, -1);
+        FrameRect(dst_rect);
+
+        { Draw the zoom box. }
+        DrawZoomBox;
+    END;
+
+
+    { Draw the axes next to the graph. }
+    PROCEDURE DrawAxes;
+    VAR
+        tick_label:   DecStr;
+        tick_format:  DecForm;
+    BEGIN
+        { Draw imaginary axis. }
+        MoveTo(kWinTLX - 16, kWinTLY + kWinRows);
+        LineTo(kWinTLX - 10, kWinTLY + kWinRows);  { Bottom tick mark. }
+        MoveTo(kWinTLX - 13, kWinTLY + kWinRows);
+        LineTo(kWinTLX - 13, kWinTLY - 12);   { Vertical axis line. }
+        LineTo(kWinTLX - 16, kWinTLY - 9);   { Axis arrow part 1. }
+        MoveTo(kWinTLX - 10, kWinTLY - 9);
+        LineTo(kWinTLX - 13, kWinTLY - 12);   { Axis arrow part 2. }
+        MoveTo(kWinTLX - 16, kWinTLY);
+        LineTo(kWinTLX - 10, kWinTLY);   { Top tick mark. }
+
+        { Draw real axis. }
+        MoveTo(kWinTLX, kWinTLY + kWinRows + 7);
+        LineTo(kWinTLX, kWinTLY + kWinRows + 11);  { Left tick mark. }
+        MoveTo(kWinTLX, kWinTLY + kWinRows + 9);
+        LineTo(kWinTLX + kWinCols + 18,
+               kWinTLY + kWinRows + 9);  { Horizontal axis line. }
+        LineTo(kWinTLX + kWinCols + 16,
+               kWinTLY + kWinRows + 7);  { Axis arrow part 1. }
+        MoveTo(kWinTLX + kWinCols + 16,
+               kWinTLY + kWinRows + 11);
+        LineTo(kWinTLX + kWinCols + 18,
+               kWinTLY + kWinRows + 9);  { Axis arrow part 2. }
+        MoveTo(kWinTLX + kWinCols,
+               kWinTLY + kWinRows + 7);
+        LineTo(kWinTLX + kWinCols,
+               kWinTLY + kWinRows + 11);  { Right tick mark. }
+
+        { Draw axis labels. }
+        tick_format.style := FIXEDDECIMAL;
+        tick_format.digits := 5;
+        TextFont(FCent12);
+
+        { Imaginary axis labels. We've plotted the set upside-down---but we
+          label as if it were right-side up! }
+        S2Str(tick_format, -BOXGRAPH.tly, tick_label);
+        INSERT('i', tick_label, LENGTH(tick_label) + 1);
+        MoveTo(kWinTLX - 21 - StringWidth(tick_label), kWinTLY);
+        DrawString(tick_label);  { Top tick. }
+
+        S2Str(tick_format, -(BOXGRAPH.tly + BOXGRAPH.h), tick_label);
+        INSERT('i', tick_label, LENGTH(tick_label) + 1);
+        MoveTo(kWinTLX - 21 - StringWidth(tick_label), kWinTLY + kWinRows);
+        DrawString(tick_label);  { Bottom tick. }
+
+        { Real axis labels. }
+        S2Str(tick_format, BOXGRAPH.tlx, tick_label);
+        MoveTo(kWinTLX, kWinTLY + kWinRows + 22);
+        DrawString(tick_label);  { Left tick. }
+
+        S2Str(tick_format, BOXGRAPH.tlx + BOXGRAPH.w, tick_label);
+        MoveTo((kWinTLX + kWinCols - StringWidth(tick_label) DIV 2),
+               kWinTLY + kWinRows + 22);
+        DrawString(tick_label);  { Right tick. }
+    END;
+
+
+    { Draw the label indicating number of iterations. }
+    PROCEDURE DrawIterations;
+    VAR
+        iter_label:        DecStr;
+        iter_format:       DecForm;
+        label_x, label_y:  Integer;
+        blank_rect:        Rect;
+    BEGIN
+        { Prepare iterations text. }
+        TextFont(FCent12);
+        iter_format.style := FIXEDDECIMAL;
+        iter_format.digits := 0;
+        S2Str(iter_format, ITERATIONS, iter_label);
+        INSERT('Iterations: ', iter_label, 1);
+
+        { Find out where it goes. }
+        label_x := kWinTLX + (kWinCols DIV 2) - (StringWidth(iter_label) DIV 2);
+        label_y := kWinTLY + kWinRows + 35;
+
+        { Clear out old iterations text. }
+        SetRect(blank_rect, label_x - 20, label_y - 15,
+                            label_x + 20 + StringWidth(iter_label), label_y);
+        FillRect(blank_rect, white);
+
+        { Draw new iterations text. }
+        MoveTo(label_x, label_y);
+        DrawString(iter_label);
+    END;
+
+
+    { Draw one of the buttons. }
+    PROCEDURE DrawButton(button: ButtonType; highlighted: Boolean);
+    VAR
+        src_bits:  BitMap;
+        src_rect:  Rect;
+        dst_rect:  Rect;
+    BEGIN
+        src_bits.baseaddr := @BUTTONS[button];
+        src_bits.rowbytes := 4;
+        SetRect(src_bits.bounds, {left=}0, {top=}0, {right=}32, {bottom=}20);
+
+        SetRect(src_rect, {left=}0, {top=}0, {right=}29, {bottom=}20);
+        dst_rect := src_rect;
+        OffsetRect(dst_rect, BUTTON_POS[button].h, BUTTON_POS[button].v);
+
+        CopyBits(src_bits, thePort^.portBits,
+                 src_rect, dst_rect, srcCopy, {maskRgn=}NIL);
+        IF highlighted THEN BEGIN
+            InsetRect(dst_rect, 1, 1);
+            InvertRoundRect(dst_rect, {ovalWidth=}5, {ovalHeight=}5);
+        END;
+    END;
+
+
+    { Draw all of the buttons, unhighlighted.
+
+    The pause/play button is drawn approprately for the current program state. }
+    PROCEDURE DrawAllButtons;
+    BEGIN
+        DrawButton(BZOOMIN,  {highlighted=}FALSE);
+        DrawButton(BZOOMOUT, {highlighted=}FALSE);
+        DrawButton(BRESET,   {highlighted=}FALSE);
+        DrawButton(BPLUS,    {highlighted=}FALSE);
+        DrawButton(BMINUS,   {highlighted=}FALSE);
+        IF STATE = DRAWING THEN DrawButton(BPAUSE, {highlighted=}FALSE)
+                           ELSE DrawButton(BPLAY,  {highlighted=}FALSE);
+    END;
+
+
+    { Clears the screen and draws everything. }
+    PROCEDURE DrawEverything;
+    BEGIN
+        { Clear the screen. }
+        EraseRect(thePort^.portRect);
+
+        { Redraw everything. }
+        DrawGraph;
+        DrawAxes;
+        DrawIterations;
+        DrawAllButtons;
+    END;
+
+    (**** UI ACTIONS ****)
+
+    { Helper for WrapZoomBoxAround. }
+    FUNCTION _Max(a, b: Real): Real;
+    BEGIN
+        IF a > b THEN _Max := a ELSE _Max := b;
+    END;
+
+
+    { Apply the zoom box to zoom in or out. Trigger plotting to start over. }
+    PROCEDURE Zoom(dir: ZoomDirection);
+    VAR
+        scale:    Real;      { Scale the graph window by this ratio. }
+        new_box:  RealBox;   { Temporary for the scaled graph window. }
+        fit_box:  RealBox;
+
+        { For intractable zoom actions: beep and give up. }
+        PROCEDURE CancelZoom; BEGIN
+            Beep(2273, 50);  { 440 Hz, approximately, for 50 ms. }
+            EXIT(Zoom);
+        END;
+    BEGIN
+        WITH BOXZOOM DO BEGIN
+            { Short circuit: don't zoom if the zoom box is fully expanded. }
+            IF tlx >= BOXGRAPH.tlx THEN
+                IF tly >= BOXGRAPH.tly THEN
+                    IF w >= BOXGRAPH.w THEN
+                        IF h >= BOXGRAPH.h THEN EXIT(Zoom);
+
+            IF dir = ZOOMIN THEN BEGIN
+                { Refuse to zoom in tighter than maximum zoom. }
+                IF h < kZoomQuantum THEN CancelZoom;
+
+                { Compute the amount to scale the graph window as the harmonic
+                  mean of the scale estimated from the X and Y axes. }
+                scale := 2.0 / ((BOXGRAPH.w/w) + (BOXGRAPH.h/h));
+
+                { Move the top left corner of the graph window to match the
+                  top left corner of the zoom box. }
+                new_box.tlx := tlx;
+                new_box.tly := tly;
+            END ELSE { IF dir = ZOOMOUT } BEGIN
+                { Compute the amount to scale the graph window as above. }
+                scale := 2.0 / ((w/BOXGRAPH.w) + (h/BOXGRAPH.h));
+
+                { Move the top left corner of the graph window such that the
+                  original graph window would occupy the space that the zoom
+                  box occupies there now. }
+                new_box.tlx := BOXGRAPH.tlx - scale * (tlx - BOXGRAPH.tlx);
+                new_box.tly := BOXGRAPH.tly - scale * (tly - BOXGRAPH.tly);
+            END;
+        END;
+
+        { Apply the graph window scaling. We do this in a way that (to the
+          extent possible given precision, and even then we're shooting for
+          100% of the time) preserves the aspect ratio of the window, and that
+          keeps both window width and height as multiples of kWinQuantum. See
+          further discussion above the definition of kZoomQuantum. }
+        new_box.h := kZoomQuantum * ROUND(BOXGRAPH.h * scale / kZoomQuantum);
+        new_box.w := kAspect * new_box.h;
+
+        { Move or trim the graph window to fit inside the part of the complex
+          plane that we can represent with our 32-bit representation. If we
+          can't fit it, beep and give up. }
+        IF NOT FitRealBox(kZoomCols, kZoomRows, new_box, fit_box) THEN BEGIN
+            CancelZoom;
+        END;
+
+        { Copy fit graph window to the true graph window. }
+        BOXGRAPH := fit_box;
+
+        { Re-initialse zoom box to the graph window. }
+        BOXZOOM := BOXGRAPH;
+
+        { Reset plotting state to match the graph window, then resume set
+          calculation and plotting (if it wasn't already underway). }
+        ResetSetState;
+        STATE := DRAWING;
+
+        { Finally, refresh the whole display so that axes are updated. It'll
+          look a little funny to see "wrong" axes until the plot gets a little
+          ways along, but there will at least be a visible indication soon that
+          recalculation is taking place. }
+        DrawEverything;
+    END;
+
+
+    { Change the maximum number of iterations of z' = z^2 + c. }
+    PROCEDURE ChangeIterations(delta: Integer);
+    BEGIN
+        IF (ITERATIONS + delta) > 0 THEN BEGIN
+            ITERATIONS := ITERATIONS + delta;
+            DrawIterations;
+        END;
+    END;
+
+
+    { Displace the zoom box by the vector (x2,y2) - (x1,y1).
+
+    All arguments are in graph window coordinates. If the displacement vector
+    would move any part of the zoom box outside of the graph window, the box is
+    moved as far along the vector as possible whilst still remaining inside.
+
+    Args:
+      x1, y1: The first point defining the zoom box displacement vector.
+      x2, y2: The second point defining the zoom box displacement vector. }
+    PROCEDURE DragZoomBox(x1, y1, x2, y2: Real);
+    VAR
+        dx, dy:  Real;
+    BEGIN
+        { Compute the box translation vector. }
+        dx := x2 - x1;
+        dy := y2 - y1;
+
+        WITH BOXZOOM DO BEGIN
+            { Move zoom box, keeping top and left edges in the graph window. }
+            tlx := _Max(BOXGRAPH.tlx, tlx + dx);
+            tly := _Max(BOXGRAPH.tly, tly + dy);
+
+            { Next, we confine the bottom and right edges of the zoom box to
+              the graph window. We reuse dx and dy as temporaries. }
+            dx := (tlx + w) - (BOXGRAPH.tlx + BOXGRAPH.w);
+            dy := (tly + h) - (BOXGRAPH.tly + BOXGRAPH.h);
+            IF dx > 0 THEN tlx := tlx - dx;
+            IF dy > 0 THEN tly := tly - dy;
+        END;
+    END;
+
+
+    { Wrap the zoom box around the points (x1, y1) and (x2, y2).
+
+    Given two points, wrap the zoom box as tightly as possible around those
+    points subject to the following constraints:
+
+    1. The zoom box must have one corner at (x1, y1), unless doing so would
+       cause constraint 4 to be violated.
+    2. The zoom box must have the aspect ratio defined by kAspect.
+    3. The zoom box's width must be no less than 5% of the graph window's.
+    4. No part of the zoom box may extend beyond the graph window.
+
+    All arguments are in graph window coordinates and must be within the graph
+    window. To avert a violation of constraint 4, the procedure will produce a
+    zoom box large enough to fit the points, but will translate the zoom box the
+    shortest distance necessary to keep the entire box within the graph window.
+
+    Args:
+      x1, y1: The first point to wrap the zoom box around. The wrapped zoom box
+          will always have one corner on this point as long as constraint 4 is
+          not violated.
+      x2, y2: The second point to wrap the zoom box around. }
+    PROCEDURE WrapZoomBoxAround(x1, y1, x2, y2: Real);
+    VAR
+        dx, dy:  Real;
+    BEGIN
+        { Compute the width and height of the line's bounding box---and, force
+          the box to be at least as wide as the minimum zoom box width. }
+        dx := _Max(ABS(x2 - x1), 0.05 * BOXGRAPH.w);
+        dy := ABS(y2 - y1);
+
+        { Expand the bounding box's width or height as needed so that the box
+          has the same aspect ratio as the graph window. }
+        IF (dx / kAspect) < dy THEN dx := dy * kAspect
+                               ELSE dy := dx / kAspect;
+
+        { Update the zoom box. We've just computed the width and height; now,
+          the relative locations of the two coordinates will determine where the
+          top left corner of the zoom box goes. Basically, if the second point
+          is northwest of the first point, the zoom box should grow northwest;
+          if it's northeast of the first point, the zom box should grow
+          northeast, and so on. }
+        WITH BOXZOOM DO BEGIN
+            w := dx;
+            h := dy;
+            tlx := x1;
+            tly := y1;
+
+            { Grow the zoom box in the appropriate quadrant. The `_Max`es keep
+              the top and left edges of the zoom box in the graph window. }
+            IF x2 < x1 THEN tlx := _Max(BOXGRAPH.tlx, tlx - dx);
+            IF y2 < y1 THEN tly := _Max(BOXGRAPH.tly, tly - dy);
+
+            { Finally, we confine the bottom and right edges of the zoom box to
+              the graph window. We reuse dx and dy as temporaries. }
+            dx := (tlx + w) - (BOXGRAPH.tlx + BOXGRAPH.w);
+            dy := (tly + h) - (BOXGRAPH.tly + BOXGRAPH.h);
+            IF dx > 0 THEN tlx := tlx - dx;
+            IF dy > 0 THEN tly := tly - dy;
+        END;
+    END;
+
+
+    { Wait for a mouse click, calling a handler if the mouse moves.
+
+    For best results, only call if the mouse button is up.
+
+    Args:
+        x, y: Location of the mouse when the mouse button was clicked.
+        OnMove: Function argument of a handler to call when the mouse moves,
+            plus one more time just after the mouse button is clicked again.
+            The arguments are the latest mouse location. The return value of
+            `OnMove` when called after the last click is the return value of
+            this function.
+
+    Returns: the last return value of `OnMove` (see above). }
+    FUNCTION _AwaitMausClick(x, y: Pixels;
+                             FUNCTION OnMove(omx, omy: Pixels): Boolean
+                             ): Boolean;
+    VAR
+        mpos:   Point;        { Temporary "new" mouse location. }
+        i:      Integer;      { Temporary. }
+        event:  TMouseEvent;  { Click detection and final position. }
+    BEGIN
+        REPEAT
+            VGetMouse(mpos);  { Get "new" mouse location. }
+
+            { If the mouse has moved from the last location, call the mouse move
+              handler function. }
+            IF (x <> mpos.h) OR (y <> mpos.v) THEN BEGIN
+                x := mpos.h;  { Set current mouse location to new location. }
+                y := mpos.v;
+                _AwaitMausClick := OnMove(x, y);
+            END;
+
+            { Avoid QuickPort displaying the mouse wait cursor. }
+            QPYield_CPU;
+        UNTIL MouseEvent(event);  { Loop until mouse button does something... }
+
+        { Flush all remaining mouse events. It's hard to know what exactly the
+          right thing to do here is, since for any click-drag-release event
+          MouseEvent hangs until the moment of release (and then doles out all
+          of the mouse actions one-by-one for successive MouseEvent calls), but
+          doing things this way will perhaps cause zoom boxes to be shaped as
+          expected for people who drag the mouse a little bit. }
+        REPEAT
+            _AwaitMausClick := OnMove(event.mouseLoc.h, event.mouseLoc.v);
+        UNTIL NOT MouseEvent(event);
+    END;
+
+
+    { Handle mouse clicks on a button.
+
+    What this function would like to do:
+        Highlights any clicked button and waits for the user to release. The
+        button is de-highlighted if the mouse moves off the button (and
+        re-highlighted if it moves back). If the mouse is released above the
+        clicked button, the appropriate action will occur; otherwise nothing
+        happens. The mouse click is considered handled by this function in
+        either case.
+
+    Unfortunately I don't know how to accomplish this with the mouse routines
+    available in QuickPort. So, what the function does instead:
+        If the original mouse location associated with the click is on a button,
+        the appropriate action will occur and the click is marked as handled.
+
+    Args:
+        x, y: Original mouse location in screen coordinates.
+
+    Returns: TRUE iff the mouse click was handled by this function. }
+    FUNCTION MausButton(x, y: Pixels): Boolean;
+    VAR
+        which_button:        ButtonType;  { Set by OverAnyButton. }
+        was_over_last_time:  Boolean;     { State for MbOnMove. }
+
+        { Returns TRUE iff location obx, oby is over button b. }
+        FUNCTION OverButton(obx, oby: Pixels; b: ButtonType): Boolean;
+        BEGIN
+            OverButton := FALSE;  { Sigh, no short-circuiting strikes again. }
+            WITH BUTTON_POS[b] DO
+                IF obx >= h THEN
+                    IF oby >= v THEN
+                        IF obx < (h + 29) THEN
+                            OverButton := oby < (v + 20);
+        END;
+
+        { Returns TRUE iff location x, y is over any button, in which case
+          which_button will be set to the button x, y is over. If this function
+          returns FALSE, the value of which_button is undefined. }
+        FUNCTION OverAnyButton: Boolean;
+        BEGIN
+            OverAnyButton := TRUE;
+            IF OverButton(x, y, BZOOMIN) THEN BEGIN
+                which_button := BZOOMIN; EXIT(OverAnyButton); END;
+            IF OverButton(x, y, BZOOMOUT) THEN BEGIN
+                which_button := BZOOMOUT; EXIT(OverAnyButton); END;
+            IF OverButton(x, y, BRESET) THEN BEGIN
+                which_button := BRESET; EXIT(OverAnyButton); END;
+            IF OverButton(x, y, BPLUS) THEN BEGIN
+                which_button := BPLUS; EXIT(OverAnyButton); END;
+            IF OverButton(x, y, BMINUS) THEN BEGIN
+                which_button := BMINUS; EXIT(OverAnyButton); END;
+            IF OverButton(x, y, BPLAY) THEN BEGIN
+                which_button := BPLAY; EXIT(OverAnyButton); END;
+            { Note no check of BPAUSE. Since it occupies the same location as
+              BPLAY, then for the purposes of this detection function, they're
+              the same button. }
+            OverAnyButton := FALSE;
+        END;
+
+        (***** Part of our ideal implementation; see note in function body.
+
+        { Mouse move handler for _AwaitMausUp. Returns TRUE iff the mouse is
+          over the button designated by `which_button`. Changes the button
+          highlight status if the mouse moves on or off the button, which it
+          tracks between calls via the was_over_last_time variable. }
+        FUNCTION MbOnMove(omx, omy: Integer): Boolean;
+        VAR
+            over_this_time:  Boolean;
+        BEGIN
+            over_this_time := OverButton(omx, omy, which_button);
+            IF over_this_time <> was_over_last_time THEN BEGIN
+                DrawButton(which_button, {highlighted=}over_this_time);
+                was_over_last_time := over_this_time;
+            END;
+            MbOnMove := over_this_time;
+        END;
+
+        *****)
+
+        { Reset the graph window and replot the set. }
+        PROCEDURE GraphReset; BEGIN
+            InitGeometry;
+            STATE := DRAWING;
+            DrawEverything;
+        END;
+
+        { Pause plotting. }
+        PROCEDURE HandlePauseClick; BEGIN
+            STATE := PAUSED;
+            DrawButton(BPLAY, {highlighted=}FALSE);
+        END;
+
+        { If plotting has been paused, resume. If we are idle, restart plotting
+          from the top left by resetting the plotting state to its initial
+          setting for the graph window and entering DRAWING mode. }
+        PROCEDURE HandlePlayClick; BEGIN
+            IF STATE = PAUSED THEN STATE := DRAWING
+                              ELSE BEGIN ResetSetState; STATE := DRAWING; END;
+            DrawButton(BPAUSE, {highlighted=}FALSE);
+        END;
+    BEGIN
+        { If the click was not on a button, drop out to pass it on to a
+          different mouse handler. }
+        was_over_last_time := OverAnyButton;  { Sets this temporary "early." }
+        MausButton := was_over_last_time;
+        IF NOT was_over_last_time THEN EXIT(MausButton);
+
+        { OverAnyButton may think the mouse was over the Play button, but if
+          LisaMandelbrot is actively computing a new Mandelbrot Set plot, the
+          button is actually the Pause button. Refine button type to match... }
+        IF STATE = DRAWING THEN
+            IF which_button = BPLAY THEN which_button := BPAUSE;
+
+        (***** Here's the implementation of what we would like this function to
+               be able to do. It assumes a function called _AwaitMouseUp, which
+               works mostly like _AwaitMouseClick: you call it when the mouse
+               button is down, and it keeps calling MbOnMove until and just
+               after the user releases the button. It's not too hard to write a
+               pure QuickDraw/Workshop program with this functionality.
+
+        { We redraw the button so that it's highlighted. }
+        DrawButton(which_button, {highlighted=}TRUE);
+
+        { Now we wait for the mouse button to come up. If it does and our
+          mouse move handler reports that the mouse has moved off of the button,
+          then we do nothing. }
+        { NB: was_over_last_time is already set correctly: to TRUE. }
+        IF NOT _AwaitMausUp(x, y, MbOnMove) THEN Exit(MausButton);
+
+        { Otherwise, first draw the button un-highlighted. }
+        DrawButton(which_button, {highlighted=}FALSE);
+
+        *****)
+
+        { Then execute the appropriate action for the button clicked. }
+        CASE which_button OF
+            BZOOMIN:   Zoom(ZOOMIN);
+            BZOOMOUT:  Zoom(ZOOMOUT);
+            BRESET:    GraphReset;
+            BPLUS:     ChangeIterations(1);
+            BMINUS:    ChangeIterations(-1);
+            BPAUSE:    HandlePauseClick;
+            BPLAY:     HandlePlayClick;
+        END;
+    END;
+
+
+    { Handle mouse clicks outside of the graph window.
+
+    Requires that the caller has verified ahead of time that the mouse was not
+    clicked on one of the buttons. This function then determines whether the
+    click was outside of the graph window; if it was, it resets the zoom box
+    to the whole graph and waits for the mouse button to be released.
+
+    Args:
+        x, y: Original mouse location in screen coordinates.
+
+    Returns: TRUE iff the mouse click was handled by this function. }
+    FUNCTION MausOutsideGraph(x, y: Pixels): Boolean;
+    VAR
+        b:  Boolean;  { Temporary. }
+
+        (***** From an ideal implementation like the one desribed in MausButton.
+
+        { Mouse move handler for _AwaitMausMove. Does nothing. }
+        FUNCTION MogOnMove(x, y: Pixels): Boolean;
+        BEGIN
+            MogOnMove := TRUE;
+        END;
+
+        *****)
+
+    BEGIN
+        b := x <= kWinTlx;  { Short-circuiting logical operators are nice. }
+        IF NOT b THEN b := y <= kWinTly;                        { Oh well. }
+        IF NOT b THEN b := x >= (kWinTlx + kWinCols);
+        IF NOT b THEN b := y >= (kWinTly + kWinRows);
+        IF b THEN BEGIN
+            DrawZoomBox;              { Remove old zoom box. }
+            BOXZOOM := BOXGRAPH;      { Reset zoom box. }
+            DrawZoomBox;              { Draw the reset zoom box. }
+
+            (***** From the "MausButton-ideal" implementation.
+
+            { Wait for the mouse button to come up. }
+            MausOutsideGraph := _AwaitMausUp(x, y, MogOnMove);
+
+            *****)
+        END;
+        MausOutsideGraph := b;
+    END;
+
+
+    { Handle mouse clicks within an existing zoom box.
+
+    Requires that the caller has verified ahead of time that the mouse has been
+    clicked inside the graph window. This function allows the user to move an
+    existing zoom box around. It will consume any mouse click that occurs within
+    the zoom box.
+
+    Args:
+        x, y: Original mouse location in screen coordinates.
+        rx, ry: Original mouse location in graph coordinates.
+
+    Returns: TRUE iff the mouse click was handled by this function. }
+    FUNCTION MausMoveZoomBox(x, y: Pixels; rx, ry: Real): Boolean;
+    VAR
+        old_zoom:           RealBox;   { Original contents of BOXZOOM. }
+        click_in_zoom_box:  Boolean;
+
+        { Mouse move handler for _AwaitMausClick. Essentially reports the net
+          mouse motion to DragZoomBox. }
+        FUNCTION MdzbOnMove(omx, omy: Pixels): Boolean;
+        VAR
+            omrx, omry:  Real;  { New mouse location in graph coordinates. }
+        BEGIN
+            DrawZoomBox;  { Remove old zoom box. }
+
+            { Restore the zoom window to its value from before _AwaitMausUp was
+              first called, since the drag vector we'll compute is based on the
+              difference between the button-down and current mouse locations. }
+            BOXZOOM := old_zoom;
+
+            { Compute current mouse location in graph window coordinates and use
+              it to move the zoom box. }
+            WITH BOXGRAPH DO BEGIN
+                omrx := tlx + w * (omx - kWinTlx) / kWinCols;
+                omry := tly + h * (omy - kWinTly) / kWinRows;
+            END;
+            DragZoomBox(rx, ry, omrx, omry);
+
+            DrawZoomBox;  { Draw new zoom box. }
+            MdzbOnMove := TRUE;  { Always returns TRUE. }
+        END;
+    BEGIN
+        { See if the click was inside the zoom box. }
+        click_in_zoom_box := FALSE;
+        WITH BOXZOOM DO
+            IF w < BOXGRAPH.w THEN  { Sufficient to test BOXZOOM <> BOXGRAPH. }
+                IF rx > tlx THEN
+                    IF ry > tly THEN
+                        IF rx < (tlx + w) THEN
+                            click_in_zoom_box := ry < (tly + h);
+        { If it was, handle the move. }
+        IF click_in_zoom_box THEN BEGIN
+            old_zoom := BOXZOOM;
+            MausMoveZoomBox := _AwaitMausClick(x, y, MdzbOnMove);
+        END;
+        MausMoveZoomBox := click_in_zoom_box;
+    END;
+
+
+    { Handle mouse clicks on the graph window but outside of a zoom box.
+
+      For drawing a new zoom box. Requires that the caller has verified ahead of
+      time that the mouse has been clicked inside the graph window, but not
+      inside an existing zoom box. As the user moves the mouse around, the new
+      zoom box moves to enclose the location of the original click and the
+      current mouse location.
+
+      If the mouse moves outside of the graph window or back to the location of
+      the original click, the original zoom box is restored.
+
+    Args:
+        x, y: Original mouse location in screen coordinates.
+        rx, ry: Original mouse location in graph coordinates.
+
+    Returns: TRUE iff the mouse click was handled by this function. }
+    FUNCTION MausMakeZoomBox(x, y: Pixels; rx, ry: Real): Boolean;
+    VAR
+        old_zoom:  RealBox;   { Original contents of BOXZOOM. }
+
+        { Mouse move handler for _AwaitMouseClick. As long as the current mouse
+          location is inside the graph and not the original mouse location,
+          reports both mouse locations to WrapZoomBoxAround. }
+        FUNCTION MmzbOnMove(omx, omy: Integer): Boolean;
+        VAR
+            omrx, omry:  Real;  { New mouse location in graph coordinates. }
+            b:           Boolean;  { Temporary. }
+        BEGIN
+            DrawZoomBox;  { Remove old zoom box. }
+
+            { We revert to the old zoom box if the mouse exits the graph window
+              or returns to the same pixel where the mouse was first clicked. }
+            b := omx <= kWinTlx;  { No short-circuiting :-P }
+            IF NOT b THEN b := omy <= kWinTly;
+            IF NOT b THEN b := omx >= (kWinTlx + kWinCols);
+            IF NOT b THEN b := omy >= (kWinTly + kWinRows);
+            IF NOT b THEN b := (omx = x) AND (omy = y);
+            IF b THEN
+                BOXZOOM := old_zoom
+            ELSE WITH BOXGRAPH DO BEGIN
+                { Convert mouse location to graph coordinates and compute a new
+                  zoom box. }
+                omrx := tlx + w * (omx - kWinTlx) / kWinCols;
+                omry := tly + h * (omy - kWinTly) / kWinRows;
+                WrapZoomBoxAround(rx, ry, omrx, omry);
+            END;
+
+            DrawZoomBox;  { Draw new zoom box. }
+            MmzbOnMove := TRUE;  { Always returns TRUE. }
+        END;
+    BEGIN
+        { Nothing to check; we jump straight into _AwaitMausClick. }
+        old_zoom := BOXZOOM;
+        MausMakeZoomBox := _AwaitMausClick(x, y, MmzbOnMove);
+    END;
+
+
+    { A UI loop for clicking buttons and manipulating zoom boxes with the mouse.
+
+    To be called the moment the mouse is clicked.
+
+    * If the click occurs in one of the buttons, the corresponding engine action
+      and UI updates occur.
+
+    * If the click occurs outside of the graph window, the zoom box is reset to
+      the size of the graph window.
+
+    * If the click is inside the current zoom box and the zoom box isn't
+      expanded to cover the whole graph window, then the zoom box moves around
+      to follow the mouse until the mouse button is clicked again.
+
+    * Otherwise, until the mouse button is clicked again, the procedure updates
+      the zoom box to wrap around the line from the mouse's original position to
+      its current position.
+
+    In this last mode, if the mouse is moved off of the graph window or back
+    to the point where it was initially clicked, the original zoom box setting
+    is restored. }
+    PROCEDURE MausAction;
+    VAR
+        mpos:    Point;  { Initial mouse location. }
+        rx, ry:  Real;   { Mouse location in graph window coordinates. }
+    BEGIN
+        VGetMouse(mpos);  { Get initial mouse location. }
+
+        { First, see if the mouse has clicked one of the buttons. }
+        IF MausButton(mpos.h, mpos.v) THEN EXIT(MausAction);
+
+        { If not, see if it has clicked somewhere else outside of the graph. }
+        IF MausOutsideGraph(mpos.h, mpos.v) THEN EXIT(MausAction);
+
+        { Whatever happens next, we'll need to know where x, y were in graph
+          window coordinates. }
+        WITH BOXGRAPH DO BEGIN
+            rx := tlx + w * (mpos.h - kWinTlx) / kWinCols;
+            ry := tly + h * (mpos.v - kWinTly) / kWinRows;
+        END;
+
+        { Now see if the user is trying to move the zoom box. }
+        IF MausMoveZoomBox(mpos.h, mpos.v, rx, ry) THEN EXIT(MausAction);
+
+        { Lacking any other possibility, we assume the user is trying to draw
+          a new zoom box. }
+        IF MausMakeZoomBox(mpos.h, mpos.v, rx, ry) THEN EXIT(MausAction);
+    END;
+
+
+    { At last, the main UI loop. }
+    PROCEDURE UiLoop;
+    VAR
+        mouse_event:  TMouseEvent;
+        was_a_click:  Boolean;
+    BEGIN
+        { Initialise and reveal the mouse. }
+        InitCursor;
+        ShowCursor;
+
+        { Here is the UI loop itself. }
+        WHILE TRUE DO BEGIN
+            { Still drawing? Calculate another byte of the Mandelbrot set. }
+            IF STATE = DRAWING THEN BEGIN
+                UpdateSet;
+                IF MultOf8(BITMAP_INDEX) THEN BEGIN
+                    { Every so often we redraw the entire display. This keeps
+                      QuickPort from running out of memory in the QuickDraw
+                      picture it uses for scrolling. }
+                    IF BITMAP_COL = 0 THEN DrawEverything ELSE DrawGraph;
+
+                    { In case we have finished calculating. }
+                    IF STATE = IDLE THEN BEGIN
+                        DrawButton(BPLAY, {highlighted=}FALSE);
+                        DrawEverything;  { For the smallest QD picture. }
+                    END;
+                END;
+            END;
+
+            { Detect a mouse event. If we're drawing, we poll; if we're not, we
+              can just wait for the next one. The "was_a_click" name should more
+              accurately be "was_an_event" at this stage. }
+            IF STATE = DRAWING THEN
+                was_a_click := MouseEvent(mouse_event)
+            ELSE BEGIN
+                was_a_click := TRUE;
+                WaitMouseEvent(mouse_event);
+            END;
+
+            { We only really care about mouse-up events. Mouse support in
+              QuickPort is a bit too limited to handle anything like dragging. }
+            IF was_a_click THEN was_a_click := NOT mouse_event.mouseDown;
+
+            { If we're happy there's been a mouse-up, handle the click.
+              Otherwise, let other processes run for a bit. }
+            IF was_a_click THEN MausAction ELSE QPYield_CPU;
+        END;
+    END;
+
+
+BEGIN
+    { Initialise data structures. }
+    InitMandBits;
+    InitGeometry;
+    InitMiscellany;
+
+    { Draw display. }
+    DrawEverything;
+
+    { Run user interface. }
+    UiLoop;
+END.

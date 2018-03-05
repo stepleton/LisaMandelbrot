@@ -1,0 +1,19 @@
+$EXEC
+A{ssembler}LM/MANDLIB.ASM
+
+LM/MANDLIB.ASM
+P{ascal}LM/MANDLIB
+
+LM/MANDLIB
+$SUBMIT QP/MAKE(LM/MANDELQP,{ToolNumber=}271828,{OfficeDiskName=}-LOWER,<,{UnitList=}PAPER.TEXT,{OtherObjList=}LM/QPOBJS.TEXT)
+R{un}InstallTool
+Y{es, overwrite existing tools}
+LOWER{ was the target disk we used for building the tool}
+271828{ is the ToolNumber we chose}
+N{o, this tool doesn't create documents}
+N{o, we don't need a custom stationery rectangle}
+LisaMandelbrotPort{ is the tool name}
+F{ile manager}C{opy}LM/MANDELQPicon{ from this file}
+-LOWER-~{T271828~}icon{ to this file}
+Y{es, overwrite any existing file}Q{uit file manager}
+$ENDEXEC

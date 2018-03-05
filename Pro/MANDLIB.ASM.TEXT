@@ -1,0 +1,224 @@
+; Mandlib.Asm -- 68000 assembly implementations of some routines in Mandlib.
+;
+; Mandlib and any supporting programs, software libraries, and documentation
+; distributed alongside it are released into the public domain without any
+; warranty. See the UNLICENSE file for details.
+
+
+.PAGE
+.TITLE 'MANDLIB.ASM constants'  ; ==========================
+
+DEBUGF  .EQU    1                    ; [1=enable,0=disable] debug code
+
+
+.PAGE
+.TITLE 'MANDLIB.ASM macros'  ; =============================
+
+
+        ; mFixMul -- 16-bit signed fixed-point multiply
+        ; Args:
+        ;   %1: Source argument, word; bits are -2,1,1/2,1/4,1/8,...
+        ;   %2: Dest. argument, word; same scheme
+        ; Notes:
+        ;   %2's MSWord will be the extended sign of the result.
+.MACRO  mFixMul
+        MULS    %1,%2                ; Perform multiply
+        ; Arithmetic-shift the result 14-bits rightward
+
+        ; This straightforward implementation of a 14-place arithmetic shift is
+        ; expected to take 44 cycles.
+;       ASR.L   #7,%2                ; First half of shift
+;       ASR.L   #7,%2                ; Second half of shift
+
+        ; This implementation of the shift is expected to take 32 cycles for a
+        ; negative number and 42 cycles for other numbers.
+        BMI.S   @0                   ; Was the result <0? Jump to handle it
+        ANDI.W  #$C000,%2            ; "Extend" the + sign
+        BRA.S   @1                   ; Jump to rotate number into the LSWord
+@0      ORI.W   #$3FFF,%2            ; "Extend" the - sign
+@1      SWAP    %2                   ; Rotate part 1: swap "rotates" 16 places
+        ROL.L   #2,%2                ; Rotate part 2: back up two places
+.ENDM
+
+
+        ; mFixBOf -- Branch on overflow of 16bit signed fixed-pt w/extended sign
+        ; Args:
+        ;   %1: Longword whose LSWord should be checked for overflow
+        ;   %2: Where to branch on overflow
+        ; Notes:
+        ;   Contents of %1 will be destroyed if an overflow is detected
+.MACRO  mFixBOf
+        ROL.L   #1,%1                ; Rotate "sign bit" into MSWord
+        SWAP    %1                   ; LSWord to MSWord for sign analysis
+        ADDQ.W  #1,%1                ; Add one; overflow now iff > 1
+        CMPI.W  #1,%1                ; Well, are we > 1?
+        BHI.S   %2                   ; Yes, jump
+        SUBQ.W  #1,%1                ; No, restore original value part 1
+        SWAP    %1                   ; Part 2
+        ROR.L   #1,%1                ; Part 3
+.ENDM
+
+
+.PAGE
+.TITLE 'MANDLIB.ASM subroutines'  ; ========================
+
+
+; FUNCTION MandByte(c: Longint; iters, real_incr: Integer): Byte
+
+.FUNC   MandByte
+        ; D0    c; imaginary part in MSWord, real in LSWord
+        ; D1    real part increment
+        ; D2    MSWord: iterations; LSWord: bit accumulator
+        ; D3-D6 scratch
+        ; A0    return address
+
+  .IF DEBUGF
+        LINK    A6,#0                ; No-op for the debugger, part 1
+        MOVE.L  (A7)+,A6             ; No-op for the debugger, part 2
+  .ENDC
+
+        ; Starting up: copy arguments and save extra scratch registers
+        MOVE.L  (A7)+,A0             ; Save return address
+        MOVE.W  (A7)+,D1             ; Copy real part increment
+        MOVE.W  (A7)+,D2             ; Copy iterations, and...
+        SUBQ.W  #1,D2                ; ...subtract 1 for use with DBRA
+        MOVE.L  (A7)+,D0             ; Copy complex number
+        SWAP    D2                   ; Move iterations to D2 MSWord
+        MOVE.W  #1,D2                ; Prepare to accumulate bits in D2 LSWord
+        MOVEM.L D3-D6,-(A7)          ; Save scratch registers
+
+        ; Prepare to start iterative function evaluation on c
+outer   SWAP    D2                   ; Prepare to copy iteration loop counter
+        MOVE.W  D2,D3                ; Copy it to D3
+        SWAP    D2                   ; Put loop count starter value in D2 MSWord
+        MOVE.L  D0,D4                ; Initialise z = c
+
+        ; Iterative evaluation of z' = z^2 + c -- part 1, compute real part
+inner   MOVE.W  D4,D5                ; Copy real part to D5
+        mFixMul D4,D5                ; Square it
+        SWAP    D4                   ; Swap real/imaginary parts of z
+        MOVE.W  D4,D6                ; Copy imaginary part to D6
+        mFixMul D4,D6                ; Square it
+        SUB.L   D6,D5                ; Subtract imaginary^2 from real^2 into D5
+        MOVE.W  D0,D6                ; Copy c real part to D6
+        EXT.L   D6                   ; Extend its sign to longword
+        ADD.L   D6,D5                ; Add to D5, which is now z' real part
+        mFixBOf D5,reject            ; Reject if real part is overflowed
+
+        ; Iterative evaluation of z' = z^2 + c -- part 2, compute imaginary part
+        MOVE.W  D4,D6                ; Copy imaginary part to D6
+        SWAP    D4                   ; Unswap real/imaginary parts of z
+        mFixMul D4,D6                ; Multiply real and imaginary into D6
+        ASL.L   #1,D6                ; Multiply that result by 2
+        MOVE.W  D5,D4                ; Update D4 with z' real from earlier
+        SWAP    D0                   ; Swap real/imaginary parts of c
+        MOVE.W  D0,D5                ; Copy c imaginary part to D3
+        EXT.L   D5                   ; Extend its sign to longword
+        ADD.L   D6,D5                ; Add in D5 to obtain z' imaginary part
+        SWAP    D0                   ; Unswap real/imaginary parts of c
+        mFixBOf D5,reject            ; Reject if imaginary part is overflowed
+        SWAP    D4                   ; Swap real/imaginary parts of z
+        MOVE.W  D5,D4                ; Update D4 with z' imaginary
+        SWAP    D4                   ; Unswap real/imaginary parts of z'
+
+        ; If we're here, we either loop again or accept c
+        DBRA    D3,inner             ; Loop again if iterations are left
+        ORI.B   #$10,CCR             ; Set X bit to note set membership
+        BRA.S   shift                ; Jump to shift X bit into accumulator
+
+        ; If we're here, we reject c
+reject  ANDI.B  #$EF,CCR             ; Clear X bit to note set non-membership
+
+shift   ROXL.W  #1,D2                ; Shift latest bit into accumulator
+        BTST    #8,D2                ; Have we filled the accumulator?
+        BNE.S   done                 ; Yes, skip ahead to cleanup
+        ADD.W   D1,D0                ; No, advance real part of c
+        BRA.S   outer                ; Loop to get bit for the next c
+
+        ; Cleaning up: restore scratch registers and return result
+done    MOVEM.L (A7)+,D3-D6          ; Restore scratch registers
+        MOVE.B  D2,(A7)              ; Copy accumulated bits to return value
+        JMP     (A0)                 ; Return to caller
+
+  .IF DEBUGF
+        UNLK    A6                   ; Marker for the debugger, part 1
+        RTS                          ; Marker for the debugger, part 2
+.ASCII  'MANDBYTE'                   ; Routine name for the debugger
+  .ENDC
+
+
+; FUNCTION MultOf4(x: Integer): Boolean;
+
+.FUNC   MultOf4
+
+  .IF DEBUGF
+        LINK    A6,#0                ; No-op for the debugger, part 1
+        MOVE.L  (A7)+,A6             ; No-op for the debugger, part 2
+  .ENDC
+
+        ; Starting up: copy arguments and save extra scratch registers
+        MOVE.L  (A7)+,A0             ; Save return address
+        MOVE.W  (A7)+,D0             ; Copy x
+        ANDI.B   #$03,D0             ; Are bits 1 or 2 set?
+        BEQ.S   @1                   ; No, jump to return TRUE
+        CLR.W   (A7)                 ; Yes, push FALSE onto stack
+        JMP     (A0)                 ; Return to caller
+@1      MOVE.W  #$FFFF,(A7)          ; Push TRUE onto stack
+        JMP     (A0)                 ; Return to caller
+
+  .IF DEBUGF
+        UNLK    A6                   ; Marker for the debugger, part 1
+        RTS                          ; Marker for the debugger, part 2
+.ASCII  'MULTOF4 '                   ; Routine name for the debugger
+  .ENDC
+
+
+; FUNCTION MultOf8(x: Integer): Boolean;
+
+.FUNC   MultOf8
+
+  .IF DEBUGF
+        LINK    A6,#0                ; No-op for the debugger, part 1
+        MOVE.L  (A7)+,A6             ; No-op for the debugger, part 2
+  .ENDC
+
+        ; Starting up: copy arguments and save extra scratch registers
+        MOVE.L  (A7)+,A0             ; Save return address
+        MOVE.W  (A7)+,D0             ; Copy x
+        ANDI.B   #$07,D0             ; Are bits 1, 2, or 3 set?
+        BEQ.S   @1                   ; No, jump to return TRUE
+        CLR.W   (A7)                 ; Yes, push FALSE onto stack
+        JMP     (A0)                 ; Return to caller
+@1      MOVE.W  #$FFFF,(A7)          ; Push TRUE onto stack
+        JMP     (A0)                 ; Return to caller
+
+  .IF DEBUGF
+        UNLK    A6                   ; Marker for the debugger, part 1
+        RTS                          ; Marker for the debugger, part 2
+.ASCII  'MULTOF8 '                   ; Routine name for the debugger
+  .ENDC
+
+
+; FUNCTION _Pack2Xp(fpr, fpi: Integer): Longint;
+
+.FUNC   _Pack2Xp
+
+  .IF DEBUGF
+        LINK    A6,#0                ; No-op for the debugger, part 1
+        MOVE.L  (A7)+,A6             ; No-op for the debugger, part 2
+  .ENDC
+
+        ; We actually don't have to do anything, since the "packed" longint
+        ; is already sitting right there on the stack. The caller arranged
+        ; the integers in the correct way when setting up our arguments.
+        MOVE.L  (A7)+,A0             ; Save return address
+        JMP     (A0)                 ; Return to caller
+
+  .IF DEBUGF
+        UNLK    A6                   ; Marker for the debugger, part 1
+        RTS                          ; Marker for the debugger, part 2
+.ASCII  '_PACK2XP'                   ; Routine name for the debugger
+  .ENDC
+
+
+.END

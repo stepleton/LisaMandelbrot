@@ -1,0 +1,485 @@
+{ Mandlib -- Mandelbrot Set calculations with 16-bit fixed-point arithmetic.
+
+The complex number c is in the Mandelbrot set if the iterated equation
+z_k+1 = z_k * z_k + c (with z_0 = 0 + 0i) does not diverge. To evaluate this
+equation on a 68000 with no floating-point capability, the routines in this
+library make use of a 32-bit complex number representation comprising 16-bit
+big-endian fixed-point imaginary and real parts (in that order).
+
+The fixed-point parts can represent 65536 numbers from -2 to (2 - 1/16384),
+which are evenly spaced at intervals of 1/16384. Individual bit values are:
+
+   MSB                                                                  LSB
+   -2   1   1/2   1/4   1/8   1/16   ...   1/2048   1/4096   1/8192   1/16384
+
+a "two's complement-esque" representation that is more-or-less closed under
+ordinary arithmetic operations (the most important exception is overflow).
+
+Some window-sizing calculations are performed with an analogous 32-bit fixed
+point representation with the same resolution:
+
+     MSB                                                                LSB
+   -131702   65536   32768   16384   ...   1/2048   1/4096   1/8192   1/16384
+
+(But see the **LIMITATION NOTE** below.)
+
+In addition to Mandelbrot set utilities, the library contains routines for
+converting floating-point (Real) values to both fixed-point representations.
+
+Mandlib and any supporting programs, software libraries, and documentation
+distributed alongside it are released into the public domain without any
+warranty. See the UNLICENSE file for details. }
+
+
+UNIT Mandlib;
+
+
+INTERFACE
+
+
+CONST
+    { Interval between adjacent numbers in our fixed-point representation. }
+    kQuantum = { 1.0/16384.0 = } 0.00006103515625;
+
+    { Least number the 16-bit fixed-point representation can represent. }
+    kXpLeast = -2.0;
+    { Greatest number the 16-bit fixed-point representation can represent. }
+    kXpGreatest = { 2.0 - kQuantum = } 1.99993896484375;
+    { Interval between the above two. }
+    kXpRange = { kXpGreatest - kXpLeast = } 3.99993896484375;
+
+    { 16-bit fixed-point representation of kXpLeast. }
+    kXpRepLeast = -32768;    { $8000 }
+    { 16-bit fixed-point representation of kXpGreatest. }
+    kXpRepGreatest = 32767;  { $7FFF }
+    { Interval between the above two. }
+    kXpRepRange = { kXpRepGreatest - kXpRepLeast = } 65535;
+
+
+    { Least number the 32-bit fixed-point representation can represent. }
+    kLpLeast = { -2^17 = } -131072.0;
+    { Greatest number the 32-bit fixed-point representation can represent. }
+    kLpGreatest = { 2^17 - kQuantum = 131072.9993896484375 Å } 131071.984375;
+    { Interval between the above two. }
+    kLpRange = { 2*2^17 - kQuantum = 262143.9993896484375 Å } 262143.984375;
+
+    { **LIMITATION NOTE** The representation can actually accommodate 255
+      numbers beyond the value listed above for kLpGreatest, but the chosen
+      limit is dictated by kLpRange, the nearest 32-bit floating-point value
+      below 2^17 - kQuantum. This value is equal to 2^17 - 1/64. }
+
+    { 32-bit fixed-point representation of kLpLeast. }
+    kLpRepLeast = -2147483648;    { $80000000 }
+    { 32-bit fixed-point representation of kLpGreatest. }
+    kLpRepGreatest = 2147483392;  { $7FFFFF00 }
+    { 32 bits cannot represent the interval between the two. }
+    kLpRepRange = 4294967040.0;
+
+
+TYPE
+    { The compiler will represent this with an eight-bit quantity. }
+    LMByte = -128..127;
+
+    { A floating-point representation for rectangles. }
+    RealBox = RECORD
+        { X, Y coordinates of the top-left corner of the rectangle. }
+        tlx, tly: Real;
+        { Width and height of the rectangle. }
+        w, h: Real
+    END;
+
+    { A 16-bit fixed-point representation for rectangles. }
+    { Not used for now; kept in case a use crops up later. }
+    FixedBox = RECORD
+        { X, Y coordinates of the top-left corner of the rectangle. }
+        tlx, tly: Integer;
+        { Width and height of the rectangle. }
+        w, h: Integer
+    END;
+
+    { A 32-bit fixed-point representation for rectangles. }
+    LongBox = RECORD
+        { X, Y coordinates of the top-left corner of the rectangle. }
+        tlx, tly: Longint;
+        { Width and height of the rectangle. }
+        w, h: Longint
+    END;
+
+
+{ PROCEDURES AND FUNCTIONS }
+
+    { Estimate whether eight complex numbers are in the Mandelbrot set.
+
+    Iterates the equation `z_k+1 = z_k * z_k + c` for eight values of c,
+    starting with the c argument to MandByte and stepping in parallel with the
+    real axis by successively adding real_incr to c's real part. Each of the c
+    values that cause the equation to diverge will be marked with a 1 bit in the
+    returned byte.
+
+    NOTE: This routine does not check whether any of the numbers in
+    `[c.real + j*real_incr for j in 0..7]` will overflow the 16-bit
+    representation of the real part in c (see the comment at the top of this
+    file for more details on this representation).
+
+    Args:
+      complex: The first (leftmost) of the eight c arguments to the iterated
+          equation above, represented as two 16-bit fixed-point parts. (See
+          documentation on the 32-bit complex number format in the comment at
+          the top of this file.)
+      iters: Maximum number of iterations of the equation.
+      real_incr: 16-bit fixed-point value to add to the real part of c when
+          moving from one complex number to the next.
+
+    Returns: a byte whose nth most significant bit is 1 iff the nth complex
+        number of the eight evaluated by this function has not escaped after
+        `iters` iterations. }
+    FUNCTION MandByte(c: Longint; iters, real_incr: Integer): LMByte;
+
+    { Convert a Real number to the nearest 16-bit fixed-point value.
+
+    Input Real values will be clipped to the interval [-2, (2 - 1/16384)].
+
+    Args:
+      r: A Real-valued number.
+
+    Returns: the closest 16-bit fixed-point number to r. (See documentation on
+        the fixed-point format in the comment at the top of this file.) }
+    FUNCTION MakeFixedPoint(r: Real): Integer;
+
+    { Convert a Real number to the nearest 32-bit fixed-point value.
+
+    Input Real values will be clipped to the interval [-2^17, (2^17 - 1/64)].
+
+    Args:
+      r: A Real-valued number.
+
+    Returns: the closest 32-bit fixed-point number to r. (See documentation on
+        the fixed-point format in the comment at the top of this file.) }
+    FUNCTION MakeLongFixedPoint(r: Real): Longint;
+
+    { Convert complex number parts into the 32-bit format used by MandByte.
+
+    The complex number parts, supplied as floats, will first be clipped to
+    the interval [-2, (2 - 1/16384)].
+
+    Args:
+      r: Real part of the complex number, as a Real.
+      i: Imaginary part of the complex number, as a Real.
+
+    Returns: the closest 32-bit complex number representation to the value
+        (`r`+`i`i). (See documentation on the 32-bit complex number format in
+        the comment at the top of this file.) }
+    FUNCTION MakeComplex(r, i: Real): Longint;
+
+    { Transform a RealBox into bounds of our 16-bit fixed-point representation.
+
+    Given a rectangle whose sides (or entire area) might extend beyond the
+    boundaries of our fixed-point representation, shift and scale the rectangle
+    until the whole thing fits within the boundaries. The algorithm proceeds as
+    follows:
+
+    1. Identify the corner of the rectangle that's the furthest out of bounds.
+    2. Shift the rectangle so the corner winds up in bounds. Any sides of the
+       rectangle that contact the edges of the fixed-point representation are
+       then fixed in place.
+    3. Scale the rectangle by contracting the non-fixed sides until the whole
+       rectangle is in bounds.
+
+    Rectangle "shrinking" steps are made in increments of `cols` fixed-point
+    quanta for the vertical sides, or `rows` for the horizontal sides, so that
+    if the dimensions of the original rectangle were evenly divisible by these
+    values times the fixed-point quantum, the "fitted" rectangle will also be
+    evenly divisible by those intervals. Each dimension shrinks by the same
+    number of increments, and this means that for any input rectangle, a choice
+    of `cols` and `rows` with the same aspect ratio as the rectangle will
+    preserve the rectangle's aspect ratio during shrinking (that is, the
+    rectangle won't get any wider or taller).
+
+    For graphing the Mandelbrot set on the Lisa's tall-pixel display, `cols`
+    and `rows` must be chosen with care to ensure that each pixel in the graph
+    window maps to a complex number that (a) can be described exactly by our
+    fixed-point representation and (b) is evenly-spaced with its neighbours. The
+    trick is to choose values that both match the aspect ratio of the graph
+    window on the complex plane *and also* whose values as ordinary integers are
+    evenly divisble by the number of horizontal (for `cols`) or vertical (for
+    `rows`) pixels. To compute the smallest `cols` and `rows` values that
+    satisfy these constraints:
+
+      1. Let `r = box.w / box.h`. (See Args below.)
+      2. Let `m = LCM(<horizontal pixels>, <vertical pixels>)`, where `LCM(a,b)`
+         is the least common multiple of `a` and `b`.
+      3. Then set `rows = r * m` and `cols = m`.
+
+    But note that this care will do you no good unless `box.w` and `box.h` are
+    already evenly divisible by `rows` and `cols` in the first place.
+
+    Args:
+      cols, rows: as described. NOTE: These values MUST be even and positive.
+      box: rectangle to fit. NOTE: All data fields in the rectangle must fit
+          within the bounds `[kLpLeast, kLpGreatest]` or the aspect ratio of the
+          rectangle will not be preserved in the result. Also, the rectangle's
+          width and height must not be less than `cols` and `rows` fixed-point
+          quanta respectively.
+      fit: the "fitted" rectangle as a RealBox.
+
+    Returns: true iff the rectangle was successfully fit (equivalently, if all
+        of the argument requirements were met.) }
+    FUNCTION FitRealBox(cols, rows: Integer; box: RealBox;
+                        VAR fit: RealBox): Boolean;
+
+    { Transform a LongBox into bounds of our 16-bit fixed-point representation.
+
+    This function accomplishes the same thing as `FitRealBox`, except the
+    input rectangle and the result are both of type LongBox instead of RealBox.
+    Performs NONE of the error checking that `FitRealBox` does.
+
+    Args:
+      cols, rows: as described in `FitRealBox`.
+      box: rectangle to fit.
+      fit: the "fitted" rectangle as a LongBox. }
+    PROCEDURE FitLongBox(cols, rows: Integer; box: LongBox; VAR fit: LongBox);
+
+  { PUBLIC UTILITY ROUTINES }
+
+    { Return TRUE iff x is a POSITIVE multiple of 4 (or 8). }
+    FUNCTION MultOf4(x: Integer): Boolean;
+    FUNCTION MultOf8(x: Integer): Boolean;
+
+  { PRIVATE HELPERS }
+
+    { Pack two 16-bit fixed-point numbers into a 32-bit complex number.
+
+    See documentation on the 32-bit complex number format in the comment at the
+    top of this file.
+
+    Args:
+      fpr: Real part of the complex number, as a 16-bit fixed-point value.
+      fpi: Imaginary part of the complex number, as a 16-bit fixed-point value.
+
+    Returns: a 32-bit complex number formed by concatenating fpi and fpr. }
+    FUNCTION _Pack2Xp(fpr, fpi: Integer): Longint;
+
+
+IMPLEMENTATION
+
+    FUNCTION MandByte{(c: Longint; iters, real_incr: Integer): LMByte;};
+    EXTERNAL;
+
+
+    FUNCTION MakeFixedPoint{(r: Real): Integer};
+    BEGIN
+             IF r < kXpLeast THEN MakeFixedPoint := kXpRepLeast
+        ELSE IF r > kXpGreatest THEN MakeFixedPoint := kXpRepGreatest
+        ELSE MakeFixedPoint := ROUND(  { Implicit truncation to Integer. }
+            (kXpRepRange * (r - kXpLeast) / kXpRange) + kXpRepLeast);
+    END;
+
+
+    FUNCTION MakeLongFixedPoint{(r: Real): Longint};
+    BEGIN
+        IF r < kLpLeast THEN MakeLongFixedPoint := kLpRepLeast
+        ELSE IF r > kLpGreatest THEN MakeLongFixedPoint := kLpRepGreatest
+        ELSE MakeLongFixedPoint := ROUND(
+            (kLpRepRange * (r - kLpLeast) / kLpRange) + kLpRepLeast);
+    END;
+
+
+    FUNCTION MakeComplex{(r, i: Real): Longint};
+    BEGIN
+        MakeComplex := _Pack2Xp(MakeFixedPoint(r), MakeFixedPoint(i));
+    END;
+
+
+    FUNCTION FitRealBox{(cols, rows: Integer; box: RealBox;
+                         VAR fit: RealBox): Boolean};
+    VAR
+        lbox: LongBox;
+    BEGIN
+        FitRealBox := FALSE;  { Prepare to quit early on bad input. }
+        IF cols < 0 THEN EXIT(FitRealBox);  { The standard does not guarantee }
+        IF rows < 0 THEN EXIT(FitRealBox);  { short-circuiting operators. }
+        IF ODD(cols) THEN EXIT(FitRealBox);
+        IF ODD(rows) THEN EXIT(FitRealBox);
+        IF box.tlx < kLpLeast THEN EXIT(FitRealBox);
+        IF box.tly < kLpLeast THEN EXIT(FitRealBox);
+        IF box.w < (cols * kQuantum) THEN EXIT(FitRealBox);
+        IF box.h < (rows * kQuantum) THEN EXIT(FitRealBox);
+        IF (box.w + box.tlx) > kLpGreatest THEN EXIT(FitRealBox);
+        IF (box.h + box.tly) > kLpGreatest THEN EXIT(FitRealBox);
+        FitRealBox := TRUE;  { Well, we can't blame the user anymore. }
+
+        { Derive a LongBox from the input RealBox, and fit it. }
+        lbox.tlx := MakeLongFixedPoint(box.tlx);
+        lbox.tly := MakeLongFixedPoint(box.tly);
+        lbox.w := MakeLongFixedPoint(box.w);
+        lbox.h := MakeLongFixedPoint(box.h);
+        FitLongBox(cols, rows, lbox, lbox);
+
+        { Convert the result back to a RealBox. }
+        fit.tlx := kXpLeast + kQuantum * (lbox.tlx - kXpRepLeast);
+        fit.tly := kXpLeast + kQuantum * (lbox.tly - kXpRepLeast);
+        fit.w := kXpLeast + kQuantum * (lbox.w - kXpRepLeast);
+        fit.h := kXpLeast + kQuantum * (lbox.h - kXpRepLeast);
+    END;
+
+
+    PROCEDURE FitLongBox{cols, rows: Integer; box: LongBox; VAR fit: LongBox};
+    TYPE
+        { Represents edges of the box. }
+        Edge = (
+            NORTH,
+            SOUTH,
+            EAST,
+            WEST
+        );
+
+    VAR
+        brx, bry: Longint;      { Bottom right-hand corner of box. }
+
+        { For shifting the box's most distant corner in-bounds. }
+        dx, dy: Longint;        { How to shift the box. }
+        distance: Longint;      { How far that movement is (L1 distance). }
+        tmpx, tmpy: Longint;    { Temporaries for various calculations. }
+
+        { For scaling the box to fit. }
+        fixed: SET OF Edge;     { Which edges are fixed? }
+
+    { PROCEDURES AND FUNCTIONS }
+        { Returns max(a, 0). It's not just for neural nets! }
+        FUNCTION Relu(a: Longint): Longint;
+        BEGIN
+            IF a > 0 THEN Relu := a ELSE Relu := 0;
+        END;
+
+        { Copies current box to output and exits the function. }
+        PROCEDURE CopyAndExit;
+        BEGIN
+            fit.tlx := box.tlx;
+            fit.tly := box.tly;
+            fit.w := box.w;
+            fit.h := box.h;
+            EXIT(FitLongBox);
+        END;
+
+    BEGIN
+        WITH box DO BEGIN
+            { ## Setup: find box's southeast corner. }
+
+            brx := tlx + w;
+            bry := tly + h;
+
+            { ## Step 1: See which corner is the most out-of-bounds, if any. }
+
+            dx := 0;
+            dy := 0;
+            distance := 0;
+
+            tmpx := Relu(kXpRepLeast - tlx);     { Check top-left corner. }
+            tmpy := Relu(kXpRepLeast - tly);
+            IF (tmpx > 0) OR (tmpy > 0) THEN BEGIN
+                dx := tmpx;
+                dy := tmpy;
+                distance := tmpx + tmpy;
+                fixed := [];
+                IF dx <> 0 THEN fixed := fixed + [WEST];
+                IF dy <> 0 THEN fixed := fixed + [NORTH];
+            END;
+
+            tmpx := Relu(brx - kXpRepGreatest);  { Check top-right corner. }
+            { tmpy is correct from before. }
+            IF tmpx > 0 { OR tmpy > 0 } THEN
+                IF (tmpx + tmpy) > distance THEN BEGIN
+                    dx := -tmpx;
+                    dy := tmpy;
+                    distance := tmpx + tmpy;
+                    fixed := [EAST];
+                    IF dy <> 0 THEN fixed := fixed + [NORTH];
+                END;
+
+            { tmpx is correct from before. }     { Check bottom-right corner. }
+            tmpy := Relu(bry - kXpRepGreatest);
+            IF { tmpx > 0 OR } tmpy > 0 THEN
+                IF (tmpx + tmpy) > distance THEN BEGIN
+                    dx := -tmpx;
+                    dy := -tmpy;
+                    distance := tmpx + tmpy;
+                    fixed := [SOUTH];
+                    IF dx <> 0 THEN fixed := fixed + [EAST];
+                END;
+
+            tmpx := Relu(kXpRepLeast - tlx);     { Check bottom-left corner. }
+            { tmpy is correct from before. }
+            IF tmpx > 0 { OR tmpy > 0 } THEN
+                IF (tmpx + tmpy) > distance THEN BEGIN
+                    dx := tmpx;
+                    dy := -tmpy;
+                    { Don't need to set distance anymore. }
+                    fixed := [WEST];
+                    IF dy <> 0 THEN fixed := fixed + [SOUTH];
+                END;
+
+            { ## Step 2: Shift the most distant corner to be in-bounds. }
+
+            IF dx = 0 THEN  { Short-circuit if the box is already in bounds. }
+                IF dy = 0 THEN CopyAndExit;
+            tlx := tlx + dx;
+            tly := tly + dy;
+            brx := brx + dx;
+            bry := bry + dy;
+
+            { ## Step 3: Scale box if needed by contracting non-fixed sides. }
+
+            { Figure out how much scaling we'll need in either dimension. }
+            dx := Relu(kXpRepLeast - tlx) + Relu(brx - kXpRepGreatest);
+            dy := Relu(kXpRepLeast - tly) + Relu(bry - kXpRepGreatest);
+            IF dx = 0 THEN  { Short-circuit if no scaling is required. }
+                IF dy = 0 THEN CopyAndExit;
+
+            { Convert scaling to multiples of rows/cols (rounded up). }
+            tmpx := dx DIV cols;
+            tmpy := dy DIV rows;
+            IF (dx MOD cols) <> 0 THEN tmpx := SUCC(tmpx);
+            IF (dy MOD rows) <> 0 THEN tmpy := SUCC(tmpy);
+
+            { We will scale by the largest of these. }
+            IF tmpy > tmpx THEN tmpx := tmpy;  { Ignore the x in tmpx here. }
+            dx := tmpx * cols;
+            dy := tmpx * rows;
+
+            { Scaling part 1: adjust the box's width and height. }
+            w := w - dx;
+            h := h - dy;
+
+            { Scaling part 2: shift the top-left corner, if necessary. }
+            IF EAST IN fixed THEN BEGIN
+                tlx := tlx + dx;
+            END ELSE BEGIN
+                IF NOT (WEST IN fixed) THEN tlx := tlx + (dx DIV 2);
+            END;
+            IF SOUTH IN fixed THEN BEGIN
+                tly := tly + dy;
+            END ELSE BEGIN
+                IF NOT (NORTH IN fixed) THEN tly := tly + (dy DIV 2);
+            END;
+        END;
+
+        CopyAndExit;  { Reuses code that prepared the output of this function. }
+    END;
+
+
+  { PUBLIC UTILITY ROUTINES }
+
+    FUNCTION MultOf4{(x: Integer): Boolean};
+    EXTERNAL;
+
+
+    FUNCTION MultOf8{(x: Integer): Boolean};
+    EXTERNAL;
+
+
+  { PRIVATE HELPERS }
+
+    FUNCTION _Pack2Xp{(fpr, fpi: Integer): Longint};
+    EXTERNAL;
+
+END.
